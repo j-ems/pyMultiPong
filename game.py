@@ -1,17 +1,17 @@
-import argparse
 import curses
-from multiprocessing import Process
-from server import Server
-
+import command as cmd
 from twisted.internet import reactor
 from twisted.internet.protocol import Protocol, ClientFactory
-from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
+from twisted.internet.task import LoopingCall
+
+from twisted.python import log
+
 
 from json import JSONDecoder, JSONEncoder
 import logging
 
 PORT = 8888
-logging.basicConfig(filename='pyMultiPong_client.log',
+logging.basicConfig(filename='pyMultiPong.log',
                     level=logging.DEBUG, format='%(asctime)s %(message)s')
 
 
@@ -19,6 +19,8 @@ class Game:
 
     def __init__(self, args):
         self.startArgs = args
+
+        logging.info('CLIENT: started client game instance')
 
         self.stdscr = curses.initscr()
         curses.noecho()
@@ -32,94 +34,58 @@ class Game:
         self.win.border()
         self.win.refresh()
 
-        self.gamePipe = Pipeline()  # this holds our clientside commands
+        self.clientBuffer = cmd.commandBuffer()  # holds clientside commands
         self.clientState = "INIT"
         self.serverState = None
+        self.playerNum = None
 
-        reactor.connectTCP(self.startArgs.ip, PORT, ClientFactory())
+        self.paddleLeft = cmd.Paddle('left', 0, 5)
+        self.paddleRight = cmd.Paddle('right', 0, 5)
+
+        # intialize the client and network handlers
+        self.clientInputHandler = cmd.InputHandler()
+
+        # the network handler has to know which pipe to add commands to
+        # since it processes commands outside of the game loop
+        self.networkHandler = cmd.NetworkCommandHandler(self.clientBuffer)
+
+        reactor.connectTCP(self.startArgs.ip, PORT,
+                           ClientFactory(self.networkHandler))
+
+        self.clientActor = None  # This gets set to the paddle we control
+        self.serverActor = None  # This gets set to the paddle sever controls
+
+    def periodic_task_crashed(reason):
+        logging.info(reason.getErrorMessage() + "periodic_task broken")
+
+    def start(self):
+        lc = LoopingCall(self.loop())
+        self.d = lc.start(1)
+        self.d.addErrback(self.periodic_task_crashed)
         reactor.run()
 
+
     def loop(self):
-        ch = curses.getch()
-        if(ch == curses.ERR):
-            curses.refresh()
-        else:
-            command = InputHandler.handleInput(ch)
-            self.gamePipe.add(command)
-
-
-class Paddle:
-    def __init__(self, posX, posY, color, length):
-        self.posX = posX
-        self.posY = posY
-        self.color = color
-        self.length = length
-
-    def draw(self, window):
-        for i in range(self.length):
-            window.addch(self.posY + i,
-                         self.posX, ' ',
-                         curses.color_pair(self.color))
-
-    def up(self):
-        self.posY = self.posY + 1
-
-    def down(self):
-        self.posY = self.posY - 1
-
-
-class Pipeline:  # An object that holds commands and executes them
-    def __init__(self):
-        self.commands = []
-
-    def add(self, command):
-        self.commands.append(command)
-
-    def run(self):
-        for c in self.commands:
-            c.execute()
-
-
-class Command:
-    def execute(self, actor):
-        pass
-
-
-class upCommand(Command):
-    def execute(self, actor):
-        actor.up()
-
-
-class downCommand(Command):
-    def execute(self, actor):
-        actor.down()
-
-
-class InputHandler():
-    def handleInput(ch):
-        if ch == curses.KEY_UP:
-            return upCommand()
-        if ch == curses.KEY_DOWN:
-            return downCommand()
-
-
-class NetworkCommandHandler():
-    def __init__(self, pipe):
-        self.pipe = pipe
-
-    def handleNetwork(self, data):
+        # run any commands we may have recieved over the network
         try:
-            response = JSONDecoder().decode(data)
-            response.serverState
-            # todo: add the command handling
-        except ValueError:
-            logging.warning("incoming data was malformated")
+            self.clientBuffer.runRemove()
+            logging.info('loop')
+            ch = self.win.getch()
+            if(ch == curses.ERR):
+                self.win.refresh()
+            else:
+                command = self.clientInputHandler.handleInput(ch)
+                if command is not None:
+                    self.clientBuffer.add(command)
+        except:
+            self.d.errback()
 
 
 class Client(Protocol):
 
     def __init__(self, handler):
         self.handler = handler
+        logging.info('CLIENT: started client protocol')
 
     def sendMessage(self, msg):
         self.transport.write(msg)
@@ -131,53 +97,17 @@ class Client(Protocol):
 class ClientFactory(ClientFactory):
     def __init__(self, handler):
         self.handler = handler
+        logging.info('CLIENT: started client connection factory')
 
     def startedConnecting(self, connector):
-        logging.info('Started to connect.')
+        logging.info('CLIENT: Started to connect.')
 
     def buildProtocol(self, addr):
-        logging.info('Connected.')
+        logging.info('CLIENT: Connected.')
         return Client(self.handler)
 
     def clientConnectionLost(self, connector, reason):
-        logging.info('Lost connection.  Reason:', reason)
+        logging.info('CLIENT: Lost connection.  Reason:' + reason.getErrorMessage())
 
     def clientConnectionFailed(self, connector, reason):
-        logging.info('Connection failed. Reason:', reason)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="pyMultiPong, a multiplayer curses pong game")
-    subparsers = parser.add_subparsers()
-
-    # parser for client functionality
-    parser_client = subparsers.add_parser('client')
-    parser_client.add_argument(
-        "-C", help="Use to run pyMultiPoing as a client",
-        action='store_const',
-        const=True)
-    parser_client.add_argument(
-        "--ip", help="specify server to connect to", required=False)
-    parser_client.set_defaults(C=True, ip='127.0.0.1')
-
-    # parser for server functionality
-    parser_server = subparsers.add_parser('server')
-    parser_server.add_argument(
-        "-S", help="Use to run pyMultiPoing as a server",
-        action='store_const',
-        const=True)
-    parser_server.add_argument(
-        "--nogame", help="Run pyMultiPong server without playing the game",
-        action='store_const',
-        const=True)
-    parser_server.set_defaults(S=True, nogame=False, ip='127.0.0.1')
-
-    args = parser.parse_args()
-
-    if args.nogame is False:
-        game = Game(args)
-    if args.S:
-        server = Server(args)
-        serverProcess = Process(target=server)
-        serverProcess.start()
+        logging.info('CLIENT: Connection failed. Reason:' + reason.getErrorMessage())
